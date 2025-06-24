@@ -119,8 +119,8 @@ const TaskQueue = struct {
         var old_head: *Node = undefined;
 
         while (true) {
-            old_head = self.head.load(.acquire).?;
-            const old_tail = self.tail.load(.acquire).?;
+            old_head = self.head.load(.acquire) orelse return null;
+            const old_tail = self.tail.load(.acquire) orelse return null;
             const next_ptr = old_head.next.load(.acquire);
 
             // Check if head hasn't changed
@@ -376,10 +376,21 @@ fn addOne(arg: *i32) void {
 /// Square arr[index].
 /// Arguments:
 ///     index: usize - The index of the array place to square.
-///     arr: []u32 - A slice to square an element of.
-fn square(index: usize, arr: []u32) void {
+///     arr: []u64 - A slice to square an element of.
+fn square(index: usize, arr: []u64) void {
     arr[index] = arr[index] * arr[index];
-    //std.debug.print("{d} -> {d}\n", .{ index, arr[index] });
+}
+
+/// Parallel squaring function
+/// Arguments:
+///     index: usize - The index of the array place to start squaring.
+///     arr: []u64 - A slice to square.
+///     step: usize - A step value.
+fn par_square(index: usize, arr: []u64, step: usize) void {
+    var i = index;
+    while (i < arr.len) : (i += step) {
+        arr[i] = arr[i] * arr[i];
+    }
 }
 
 /// Push a task to a TaskQueue.
@@ -468,12 +479,12 @@ test "Complex Task run" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    var test_arr = [_]u32{ 1, 2, 3, 4, 5 };
+    var test_arr = [_]u64{ 1, 2, 3, 4, 5 };
     const arr_slice = test_arr[0..];
 
     for (0..test_arr.len) |i| {
         const args = .{ i, arr_slice };
-        const FuncType = *const fn (usize, []u32) void;
+        const FuncType = *const fn (usize, []u64) void;
         const ArgType = @TypeOf(args);
         const Context = struct {
             f: FuncType,
@@ -727,7 +738,7 @@ test "TaskQueue single threaded push multi threaded pop" {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     const allocator = gpa.allocator();
 
-    var test_arr = [_]u32{ 1, 2, 3, 4, 5 };
+    var test_arr = [_]u64{ 1, 2, 3, 4, 5 };
     const arr_slice = test_arr[0..];
 
     var threads: [5]std.Thread = undefined;
@@ -736,7 +747,7 @@ test "TaskQueue single threaded push multi threaded pop" {
 
     for (0..test_arr.len) |i| {
         const args = .{ i, arr_slice };
-        const FuncType = *const fn (usize, []u32) void;
+        const FuncType = *const fn (usize, []u64) void;
         const ArgType = @TypeOf(args);
         const Context = struct {
             f: FuncType,
@@ -795,7 +806,7 @@ test "TaskQueue multi threaded push multi threaded pop" {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     const allocator = gpa.allocator();
 
-    var test_arr = [_]u32{ 1, 2, 3, 4, 5 };
+    var test_arr = [_]u64{ 1, 2, 3, 4, 5 };
     const arr_slice = test_arr[0..];
 
     var producer_threads: [5]std.Thread = undefined;
@@ -805,7 +816,7 @@ test "TaskQueue multi threaded push multi threaded pop" {
 
     for (0..test_arr.len) |i| {
         const args = .{ i, arr_slice };
-        const FuncType = *const fn (usize, []u32) void;
+        const FuncType = *const fn (usize, []u64) void;
         const ArgType = @TypeOf(args);
         const Context = struct {
             f: FuncType,
@@ -889,7 +900,7 @@ test "consumer/ThreadGroup wait test" {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     const allocator = gpa.allocator();
 
-    var test_arr = [_]u32{ 1, 2, 3, 4, 5 };
+    var test_arr = [_]u64{ 1, 2, 3, 4, 5 };
     const arr_slice = test_arr[0..];
 
     var producer_threads: [5]std.Thread = undefined;
@@ -901,7 +912,7 @@ test "consumer/ThreadGroup wait test" {
 
     for (0..test_arr.len) |i| {
         const args = .{ i, arr_slice };
-        const FuncType = *const fn (usize, []u32) void;
+        const FuncType = *const fn (usize, []u64) void;
         const ArgType = @TypeOf(args);
         const Context = struct {
             f: FuncType,
@@ -969,14 +980,14 @@ test "ThreadPool test" {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     const allocator = gpa.allocator();
 
-    var test_arr = [_]u32{ 1, 2, 3, 4, 5 };
+    var test_arr = [_]u64{ 1, 2, 3, 4, 5 };
     const arr_slice = test_arr[0..];
 
     var t_pool = try ThreadPool.init(allocator, .{ .n_jobs = test_arr.len });
     defer t_pool.deinit();
 
     for (0..test_arr.len) |i| {
-        try t_pool.spawn(*const fn (usize, []u32) void, square, .{ i, arr_slice });
+        try t_pool.spawn(*const fn (usize, []u64) void, square, .{ i, arr_slice });
     }
 
     t_pool.join();
@@ -994,16 +1005,43 @@ test "ThreadPool performance test" {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     const allocator = gpa.allocator();
 
-    var test_arr1 = try allocator.alloc(u32, 4096 * 4096);
-    var test_arr2 = try allocator.alloc(u32, 4096 * 4096);
+    var test_arr1 = try allocator.alloc(u64, 4096 * 4096);
+    var test_arr2 = try allocator.alloc(u64, 4096 * 4096);
     defer allocator.free(test_arr1);
     defer allocator.free(test_arr2);
 
-    var i: u32 = 0;
+    var i: u64 = 0;
     while (i < test_arr1.len) : (i += 1) {
         test_arr1[i] = i;
         test_arr2[i] = i;
     }
 
-    var t_pool = try ThreadPool.init(allocator, .{ .n_jobs = 1024 });
+    var t_pool = try ThreadPool.init(allocator, .{ .n_jobs = 8 });
+    defer t_pool.deinit();
+
+    const seq_start = try std.time.Instant.now();
+    for (0..test_arr1.len) |index| {
+        square(index, test_arr1);
+    }
+    const seq_end = try std.time.Instant.now();
+    const seq_elapsed: f64 = @floatFromInt(seq_end.since(seq_start));
+
+    const par_start = try std.time.Instant.now();
+    for (0..t_pool.n_jobs) |index| {
+        try t_pool.spawn(*const fn (usize, []u64, usize) void, par_square, .{ index, test_arr2, t_pool.n_jobs });
+    }
+    t_pool.join();
+    const par_end = try std.time.Instant.now();
+    const par_elapsed: f64 = @floatFromInt(par_end.since(par_start));
+
+    try std.testing.expect(par_elapsed < seq_elapsed);
+
+    std.debug.print("ThreadPool performance test:\n", .{});
+    std.debug.print("-" ** 100, .{});
+    std.debug.print("\n", .{});
+    std.debug.print("Sequential time to square large array: {d}\n", .{seq_elapsed});
+    std.debug.print("Parallel time to square large array: {d}\n", .{par_elapsed});
+    std.debug.print("Parallel time reduction: {d:.1}%\n", .{(seq_elapsed - par_elapsed) / seq_elapsed * 100.0});
+    std.debug.print("-" ** 100, .{});
+    std.debug.print("\n", .{});
 }
