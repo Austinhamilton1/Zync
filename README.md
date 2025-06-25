@@ -11,6 +11,8 @@ its types.
 
 ### What Zync is not.
 
+Zync currently has no support for hardware accelerated computing (i.e., it has no OpenCL, Vulkan, CUDA, etc. backend).
+
 Zync is not currently a "plug-and-play" library. A working knowledge of the inner-workings of the library will help with implementations.
 
 ## Data Types of Zync
