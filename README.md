@@ -53,7 +53,7 @@ Zync is not currently a "plug-and-play" library. A working knowledge of the inne
   - [X] Pop
   - [X] Push
 - [ ] BoundedTaskQueue for adding tasks to a queue to be completed (second iteration)
-- [X] Atomic ring buffer data structure
+  - [X] Atomic ring buffer data structure
   - [X] Global pop
   - [X] Global push
   - [ ] Local thread based pop
