@@ -17,9 +17,13 @@ Zync is not currently a "plug-and-play" library. A working knowledge of the inne
 
 ## Data Types of Zync
 
-### RobustThread
+### Consumer
 
-*Put a description of RobustThread here.*
+*Put a description of Consumer here.*
+
+### Scheduler
+
+*Put a description of Scheduler here.*
 
 ### BoundedTaskQueue
 
@@ -67,7 +71,8 @@ Zync is not currently a "plug-and-play" library. A working knowledge of the inne
 - [X] ThreadGroup implementation
   - [X] Count task completion status
   - [X] Allow for generic synchronization of Threads  
-- [ ] Implement RobustThread (ID, thread-local work queue, error recovery, etc.)
+- [ ] Implement Consumer (ID, thread-local work queue, error recovery, etc.)
+- [ ] Implement Scheduler
 - [ ] Add work stealing ability to Bounded Task Queue
 - [ ] ThreadPool implementation
   - [X] Allocate `n_jobs` worker threads that await a task.
