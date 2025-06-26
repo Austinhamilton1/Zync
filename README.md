@@ -21,17 +21,9 @@ Zync is not currently a "plug-and-play" library. A working knowledge of the inne
 
 *Put a description of Consumer here.*
 
-### Scheduler
+### VynukovQueue
 
-*Put a description of Scheduler here.*
-
-### BoundedTaskQueue
-
-*Put a description of the BoundedTaskQueue here.*
-
-### UnboundedTaskQueue
-
-*Put a description of the UnboundedTaskQueue here.*
+*Put a description of the BoundedTaskQueue here.
 
 ### ChaseLevDeque
 
@@ -71,13 +63,13 @@ Zync is not currently a "plug-and-play" library. A working knowledge of the inne
 - [X] ThreadGroup implementation
   - [X] Count task completion status
   - [X] Allow for generic synchronization of Threads  
-- [ ] Implement Consumer (ID, thread-local work queue, error recovery, etc.)
-- [ ] Implement Scheduler
-- [ ] Add work stealing ability to Bounded Task Queue
+- [X] Implement Consumer (ID, thread-local work queue, error recovery, etc.)
+- [X] Add work stealing ability to Consumer
 - [ ] ThreadPool implementation
   - [X] Allocate `n_jobs` worker threads that await a task.
   - [X] Global task queue for workers to grab from.
-  - [ ] Work stealing scheduling
+  - [X] Work stealing scheduling
+  - [ ] Optimize work stealing for faster context switches
   - [ ] Fork/join setup
 - [ ] Start working on Zync library features
   - [ ] par_sort
