@@ -5,6 +5,7 @@ pub const ThreadPoolError = error{
     TooManyThreads, // Trying to spawn more than 1024 threads
     ForkError, // One of the spawns did not work in the fork method; discard results
     QueueFull, // BoundedTaskQueue can't accept any more tasks
+    AlreadyStolen, // ChaseLevTaskQueue had two concurrent stolen tasks
 };
 
 /// Represents a Task needing to be run.
@@ -274,6 +275,135 @@ pub const BoundedTaskQueue = struct {
         return task;
     }
 };
+
+/// A double ended task queue for work stealing.
+/// This is based on the Chase-Lev deque (https://www.dre.vanderbilt.edu/~schmidt/PDF/work-stealing-dequeue.pdf)
+/// The Chase-Lev deque offers a lock-free work-stealing queue
+/// that overcomes the buffer overflow issue of many current
+/// work stealing deques.
+pub const ChaseLevDeque = struct {
+    /// bottom: usize - Values are only pushed and popped from bottom in the owner thread.
+    /// top: std.atomic.Value(usize) - Values are only stolen (never pushed) from the top by other threads.
+    /// buffer: []Task - The queue is a resizeable circular buffer of Task objects.
+    /// buffer_mask: usize - Value used to quickly determine the Task associated with an index.
+    /// allocator: std.mem.Allocator - An allocator to allocate the buffer.
+    bottom: usize,
+    top: std.atomic.Value(usize),
+    buffer: []Task,
+    buffer_mask: usize,
+    allocator: std.mem.Allocator,
+
+    const Self = @This();
+
+    /// Initialize a ChaseLevDeque
+    /// Arguments:
+    ///     allocator: std.mem.Allocator - An allocator to allocate the buffer.
+    /// Returns:
+    ///     An initialized ChaseLevDeque object.
+    pub fn init(allocator: std.mem.Allocator) !Self {
+        const buffer_mask = 1023;
+        const buffer = try allocator.alloc(Task, 1024);
+        return Self{ .bottom = std.atomic.Value(usize).init(0), .top = std.atomic.Value(usize).init(0), .buffer = buffer, .buffer_mask = buffer_mask };
+    }
+
+    /// Destroy a ChaseLevDeque object
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.buffer);
+    }
+
+    /// Perform a CAS operation on the top pointer.
+    /// Arguments:
+    ///     expected_value: usize - Check if the value is equal to this expected value.
+    ///     new_value: usize - If the comparison works, substitute this value.
+    /// Returns:
+    ///     true on success, false on failure.
+    pub fn casTop(self: *Self, expected_value: usize, new_value: usize) bool {
+        // @cmpxchgStrong returns null on sucess, so this seems backwards
+        if (self.top.cmpxchgStrong(expected_value, new_value, .acq_rel, .acquire)) |_| {
+            return false;
+        }
+        return true;
+    }
+
+    /// Push a value to the bottom of the deque. This is an easy operation
+    /// since only the owner thread will be pushing to the deque.
+    /// Arguments:
+    ///     task: Task - The task to push to the bottom of the queue.
+    /// Returns:
+    ///     void on success, ThreadPoolError.QueueFull when the queue is full.
+    pub fn push(self: *Self, task: Task) !void {
+        const t = self.top.load(.acquire);
+        const size = self.bottom - t;
+        if (size >= self.buffer_mask) {
+            return ThreadPoolError.QueueFull;
+        }
+        self.buffer[self.bottom & self.buffer_mask] = task;
+        self.bottom += 1;
+    }
+
+    /// Steal a value from the top of the deque. The stealing thread must ensure
+    /// that another thread has not already stole the bottom value.
+    /// Returns:
+    ///     A Task if one is available, null on empty, ThreadPoolError.AlreadyStolen
+    ///     if another concurrent thread stole the top before we had a chance.
+    pub fn steal(self: *Self) !?Task {
+        const t = self.top.load(.acquire);
+
+        // Deque is empty
+        if (self.bottom <= t) {
+            return null;
+        }
+
+        // Must grab task before CAS because after CAS, this value
+        // may be written over with another value by push (due to circular buffer)
+        const task = self.buffer[t & self.buffer_mask];
+        if (!self.casTop(t, t + 1)) {
+            return ThreadPoolError.AlreadyStolen;
+        }
+        return task;
+    }
+
+    /// Pop a value from the bottom of the deque. Pop is a little more complicated
+    /// because a pop/steal race may arise.
+    /// Retunrs:
+    ///  A Task if one is available, null on empty.
+    pub fn pop(self: *Self) ?Task {
+        // Decrement the bottom pointer to get the next Task
+        self.bottom = self.bottom - 1;
+        const t = self.top.load(.acquire);
+
+        // The deque is empty
+        if (self.bottom < t) {
+            // Reset the deque back to a canonical empty state (bottom = top)
+            self.bottom = t;
+            return null;
+        }
+
+        // Deque is not empty, but a concurrent steal operation could still
+        // race on this task
+        const task = self.buffer[self.bottom & self.buffer_mask];
+        if (self.bottom > t) {
+            // Race condition not possible (more than one item in deque)
+            return task;
+        }
+
+        // Race condition possible (one item left in deque)
+        // Try to increment top by one to test if top has been accessed
+        if (!self.casTop(t, t + 1)) {
+            // Last element was stolen, reset deque back to canonical empty state (bottom = top)
+            // We can set bottom = t + 1 because top will be t + 1 regardless of the
+            // result of the CAS (either we changed it or a steal operation did)
+            self.bottom = t + 1;
+            return null;
+        }
+
+        // No race condition, reset deque back to canonical empty state (bottom = top)
+        self.bottom = t + 1;
+        return task;
+    }
+};
+
+pub const RobustThread = struct {};
 
 /// Logical grouping of a set of Threads.
 /// Allows for waiting on all threads to hit some

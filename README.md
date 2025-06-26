@@ -29,6 +29,10 @@ Zync is not currently a "plug-and-play" library. A working knowledge of the inne
 
 *Put a description of the UnboundedTaskQueue here.*
 
+### ChaseLevDeque
+
+*Put a description of the ChaseLevDeque here.*
+
 ### ThreadPool
 
 *Put a description of the ThreadPool here.*
@@ -52,13 +56,14 @@ Zync is not currently a "plug-and-play" library. A working knowledge of the inne
   - [X] Atomic linked list data structure
   - [X] Pop
   - [X] Push
-- [ ] BoundedTaskQueue for adding tasks to a queue to be completed (second iteration)
+- [X] BoundedTaskQueue for adding tasks to a queue to be completed (second iteration)
   - [X] Atomic ring buffer data structure
-  - [X] Global pop
-  - [X] Global push
-  - [ ] Local thread based pop
-  - [ ] Local thread based push
-  - [ ] Other thread steal
+  - [X] Pop
+  - [X] Push
+- [X] ChaseLevDeque for work stealing (third iteration)
+  - [X] Local thread based pop
+  - [X] Local thread based push
+  - [X] Other thread steal
 - [X] ThreadGroup implementation
   - [X] Count task completion status
   - [X] Allow for generic synchronization of Threads  
