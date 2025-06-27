@@ -1,6 +1,8 @@
 const std = @import("std");
+const utils = @import("test-utils.zig");
 
 pub const LockFreeError = error{
+    InvalidCapacity, // A Queues capacity must be a power of 2
     QueueFull, // A thread is trying to push to a full queue
     AlreadyStolen, // A thread has stolen a value concurrently from the queue
 };
@@ -38,11 +40,15 @@ pub fn VyukovQueue(comptime T: type) type {
         /// Instantiate a VyukovQueue object.
         /// Arguments:
         ///     allocator: std.mem.Allocator - An allocator to instantiate the buffer with.
+        ///     capacity: usize - An initial capacity of the queue. Must be a power of two.
         /// Returns:
         ///     An instantiated VyukovQueue or error on allocation fail.
-        pub fn init(allocator: std.mem.Allocator) !Self {
-            const buffer_mask: usize = 4095;
-            const buffer = try allocator.alloc(Slot, buffer_mask + 1);
+        pub fn init(allocator: std.mem.Allocator, capacity: usize) !Self {
+            if (capacity & (capacity - 1) != 0) {
+                return LockFreeError.InvalidCapacity;
+            }
+            const buffer_mask: usize = capacity - 1;
+            const buffer = try allocator.alloc(Slot, capacity);
             for (buffer, 0..) |_, i| {
                 buffer[i].sequence.store(i, .release);
             }
@@ -136,12 +142,12 @@ pub fn VyukovQueue(comptime T: type) type {
 /// work stealing deques.
 pub fn ChaseLevDeque(comptime T: type) type {
     return struct {
-        /// bottom: usize - Values are only pushed and popped from bottom in the owner thread.
+        /// bottom: std.atomic.Value(usize) - Values are only pushed and popped from bottom in the owner thread.
         /// top: std.atomic.Value(usize) - Values are only stolen (never pushed) from the top by other threads.
         /// buffer: []T - The queue is a circular buffer of values.
         /// buffer_mask: usize - Value used to quickly determine the value associated with an index.
         /// allocator: std.mem.Allocator - An allocator to allocate the buffer.
-        bottom: usize,
+        bottom: std.atomic.Value(usize),
         top: std.atomic.Value(usize),
         buffer: []T,
         buffer_mask: usize,
@@ -152,12 +158,16 @@ pub fn ChaseLevDeque(comptime T: type) type {
         /// Initialize a ChaseLevDeque
         /// Arguments:
         ///     allocator: std.mem.Allocator - An allocator to allocate the buffer.
+        ///     capacity: usize - The initial capacity of the buffer (must be a power of 2).
         /// Returns:
         ///     An initialized ChaseLevDeque object.
-        pub fn init(allocator: std.mem.Allocator) !Self {
-            const buffer_mask = 4095;
-            const buffer = try allocator.alloc(T, buffer_mask + 1);
-            return Self{ .bottom = 0, .top = std.atomic.Value(usize).init(0), .buffer = buffer, .buffer_mask = buffer_mask, .allocator = allocator };
+        pub fn init(allocator: std.mem.Allocator, capacity: usize) !Self {
+            if (capacity & (capacity - 1) != 0) {
+                return LockFreeError.InvalidCapacity;
+            }
+            const buffer_mask = capacity - 1;
+            const buffer = try allocator.alloc(T, capacity);
+            return Self{ .bottom = std.atomic.Value(usize).init(0), .top = std.atomic.Value(usize).init(0), .buffer = buffer, .buffer_mask = buffer_mask, .allocator = allocator };
         }
 
         /// Destroy a ChaseLevDeque object
@@ -186,13 +196,13 @@ pub fn ChaseLevDeque(comptime T: type) type {
         /// Returns:
         ///     void on success, LockFreeError.QueueFull when the queue is full.
         pub fn push(self: *Self, value: T) !void {
+            const b = self.bottom.load(.acquire);
             const t = self.top.load(.acquire);
-            const size = self.bottom - t;
-            if (size >= self.buffer_mask) {
+            if (b - t >= self.buffer_mask) {
                 return LockFreeError.QueueFull;
             }
-            self.buffer[self.bottom & self.buffer_mask] = value;
-            self.bottom += 1;
+            self.buffer[b & self.buffer_mask] = value;
+            self.bottom.store(b + 1, .release);
         }
 
         /// Steal a value from the top of the deque. The stealing thread must ensure
@@ -202,9 +212,10 @@ pub fn ChaseLevDeque(comptime T: type) type {
         ///     if another concurrent thread stole the top before we had a chance.
         pub fn steal(self: *Self) !?T {
             const t = self.top.load(.acquire);
+            const b = self.bottom.load(.acquire);
 
             // Deque is empty
-            if (self.bottom <= t) {
+            if (b <= t) {
                 return null;
             }
 
@@ -223,20 +234,22 @@ pub fn ChaseLevDeque(comptime T: type) type {
         ///     A value if one is available, null on empty.
         pub fn pop(self: *Self) ?T {
             // Decrement the bottom pointer to get the next Task
-            self.bottom = self.bottom - 1;
+            var b = self.bottom.load(.acquire);
+            b = b - 1;
+            self.bottom.store(b, .release);
             const t = self.top.load(.acquire);
 
             // The deque is empty
-            if (self.bottom < t) {
+            if (b < t) {
                 // Reset the deque back to a canonical empty state (bottom = top)
-                self.bottom = t;
+                self.bottom.store(t, .release);
                 return null;
             }
 
             // Deque is not empty, but a concurrent steal operation could still
             // race on this task
-            const value = self.buffer[self.bottom & self.buffer_mask];
-            if (self.bottom > t) {
+            var value: T = self.buffer[b & self.buffer_mask];
+            if (b > t) {
                 // Race condition not possible (more than one item in deque)
                 return value;
             }
@@ -247,12 +260,11 @@ pub fn ChaseLevDeque(comptime T: type) type {
                 // Last element was stolen, reset deque back to canonical empty state (bottom = top)
                 // We can set bottom = t + 1 because top will be t + 1 regardless of the
                 // result of the CAS (either we changed it or a steal operation did)
-                self.bottom = t + 1;
-                return null;
+                value = null;
             }
 
             // No race condition, reset deque back to canonical empty state (bottom = top)
-            self.bottom = t + 1;
+            self.bottom.store(t + 1, .release);
             return value;
         }
     };
@@ -282,6 +294,121 @@ const test_func = struct {
             _ = sum.fetchAdd(value, .acq_rel);
         }
     }
+
+    /// Time the VyukovQueue push method
+    fn time_queue_push(comptime T: type, queue: *VyukovQueue(T), value: T, min_time: *std.atomic.Value(usize), max_time: *std.atomic.Value(usize), total_time: *std.atomic.Value(usize)) !void {
+        var min: usize = 1_000_000_000_000;
+        var max: usize = 0;
+        for (0..512) |_| {
+            const start_time = try std.time.Instant.now();
+            queue.push(value) catch {};
+            const end_time = try std.time.Instant.now();
+            const elapsed = end_time.since(start_time);
+            if (elapsed < min)
+                min = elapsed;
+            if (elapsed > max)
+                max = elapsed;
+            _ = total_time.fetchAdd(elapsed, .acq_rel);
+        }
+        if (min < min_time.load(.acquire)) {
+            min_time.store(min, .release);
+        }
+        if (max > max_time.load(.acquire)) {
+            max_time.store(max, .release);
+        }
+    }
+
+    /// Time the VyukovQueue pop method
+    fn time_queue_pop(comptime T: type, queue: *VyukovQueue(T), min_time: *std.atomic.Value(usize), max_time: *std.atomic.Value(usize), total_time: *std.atomic.Value(usize)) !void {
+        var min: usize = 1_000_000_000_000;
+        var max: usize = 0;
+        for (0..512) |_| {
+            const start_time = try std.time.Instant.now();
+            _ = queue.pop();
+            const end_time = try std.time.Instant.now();
+            const elapsed = end_time.since(start_time);
+            if (elapsed < min)
+                min = elapsed;
+            if (elapsed > max)
+                max = elapsed;
+            _ = total_time.fetchAdd(elapsed, .acq_rel);
+        }
+        if (min < min_time.load(.acquire)) {
+            min_time.store(min, .release);
+        }
+        if (max > max_time.load(.acquire)) {
+            max_time.store(max, .release);
+        }
+    }
+
+    /// Time the ChaseLevDeque push method
+    fn time_deque_push(comptime T: type, queue: *ChaseLevDeque(T), value: T, min_time: *std.atomic.Value(usize), max_time: *std.atomic.Value(usize), total_time: *std.atomic.Value(usize)) !void {
+        var min: usize = 1_000_000_000_000;
+        var max: usize = 0;
+        for (0..4096) |_| {
+            const start_time = try std.time.Instant.now();
+            queue.push(value) catch {};
+            const end_time = try std.time.Instant.now();
+            const elapsed = end_time.since(start_time);
+            if (elapsed < min)
+                min = elapsed;
+            if (elapsed > max)
+                max = elapsed;
+            _ = total_time.fetchAdd(elapsed, .acq_rel);
+        }
+        if (min < min_time.load(.acquire)) {
+            min_time.store(min, .release);
+        }
+        if (max > max_time.load(.acquire)) {
+            max_time.store(max, .release);
+        }
+    }
+
+    /// Time the ChaseLevDeque pop method
+    fn time_deque_pop(comptime T: type, queue: *ChaseLevDeque(T), min_time: *std.atomic.Value(usize), max_time: *std.atomic.Value(usize), total_time: *std.atomic.Value(usize)) !void {
+        var min: usize = 1_000_000_000_000;
+        var max: usize = 0;
+        for (0..4096) |_| {
+            const start_time = try std.time.Instant.now();
+            _ = queue.pop();
+            const end_time = try std.time.Instant.now();
+            const elapsed = end_time.since(start_time);
+            if (elapsed < min)
+                min = elapsed;
+            if (elapsed > max)
+                max = elapsed;
+            _ = total_time.fetchAdd(elapsed, .acq_rel);
+        }
+        if (min < min_time.load(.acquire)) {
+            min_time.store(min, .release);
+        }
+        if (max > max_time.load(.acquire)) {
+            max_time.store(max, .release);
+        }
+    }
+
+    /// Time the ChaseLevDeque steal method
+    fn time_deque_steal(comptime T: type, queue: *ChaseLevDeque(T), min_time: *std.atomic.Value(usize), max_time: *std.atomic.Value(usize), total_time: *std.atomic.Value(usize)) !void {
+        var min: usize = 1_000_000_000_000;
+        var max: usize = 0;
+        for (0..256) |_| {
+            const start_time = try std.time.Instant.now();
+            _ = queue.steal() catch {};
+            const end_time = try std.time.Instant.now();
+            const elapsed = end_time.since(start_time);
+            if (elapsed < min)
+                min = elapsed;
+            if (elapsed > max)
+                max = elapsed;
+            _ = total_time.fetchAdd(elapsed, .acq_rel);
+        }
+        if (min < min_time.load(.acquire)) {
+            min_time.store(min, .release);
+        }
+        if (max > max_time.load(.acquire)) {
+            max_time.store(max, .release);
+        }
+    }
 };
 
 test "VyukovQueue single threaded push/pop" {
@@ -291,7 +418,7 @@ test "VyukovQueue single threaded push/pop" {
 
     const test_int: i32 = 1;
 
-    var queue = try VyukovQueue(i32).init(allocator);
+    var queue = try VyukovQueue(i32).init(allocator, 16);
     defer queue.deinit();
 
     for (0..10) |_| {
@@ -316,7 +443,7 @@ test "VyukovQueue fill/empty/fill" {
 
     const test_int: i32 = 1;
 
-    var queue = try VyukovQueue(i32).init(allocator);
+    var queue = try VyukovQueue(i32).init(allocator, 16);
     defer queue.deinit();
 
     var sum: i32 = 0;
@@ -353,7 +480,7 @@ test "VyukovQueue multi threaded push single threaded pop" {
 
     const test_int: i32 = 1;
 
-    var queue = try VyukovQueue(i32).init(allocator);
+    var queue = try VyukovQueue(i32).init(allocator, 16);
     defer queue.deinit();
     var threads: [10]std.Thread = undefined;
 
@@ -384,7 +511,7 @@ test "VyukovQueue single threaded push multi threaded pop" {
     const test_int: i32 = 1;
 
     var threads: [10]std.Thread = undefined;
-    var queue = try VyukovQueue(i32).init(allocator);
+    var queue = try VyukovQueue(i32).init(allocator, 16);
     defer queue.deinit();
 
     for (0..10) |_| {
@@ -412,7 +539,7 @@ test "VyukovQueue multi threaded push multi threaded pop" {
 
     var producer_threads: [10]std.Thread = undefined;
     var consumer_threads: [10]std.Thread = undefined;
-    var queue = try VyukovQueue(i32).init(allocator);
+    var queue = try VyukovQueue(i32).init(allocator, 16);
     defer queue.deinit();
 
     var sum = std.atomic.Value(i32).init(0);
@@ -445,7 +572,7 @@ test "ChaseLevDeque test" {
 
     var sum = std.atomic.Value(i32).init(0);
 
-    var deque = try ChaseLevDeque(i32).init(allocator);
+    var deque = try ChaseLevDeque(i32).init(allocator, 1024);
     defer deque.deinit();
 
     var threads: [32]std.Thread = undefined;
@@ -467,4 +594,103 @@ test "ChaseLevDeque test" {
     }
 
     try std.testing.expect(sum.load(.acquire) == 1000);
+}
+
+test "VyukovQueue performance test" {
+    // Test the performance of the VyukovQueue in a multithreaded setting
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    const allocator = gpa.allocator();
+
+    const test_int: usize = 1;
+    var min_push_time = std.atomic.Value(usize).init(1_000_000_000_000);
+    var min_pop_time = std.atomic.Value(usize).init(1_000_000_000_000);
+    var max_push_time = std.atomic.Value(usize).init(0);
+    var max_pop_time = std.atomic.Value(usize).init(0);
+    var total_push_time = std.atomic.Value(usize).init(0);
+    var total_pop_time = std.atomic.Value(usize).init(0);
+
+    var queue = try VyukovQueue(usize).init(allocator, 4096);
+    defer queue.deinit();
+
+    var producer_threads: [8]std.Thread = undefined;
+    var consumer_threads: [8]std.Thread = undefined;
+
+    for (0..producer_threads.len) |i| {
+        producer_threads[i] = try std.Thread.spawn(.{}, test_func.time_queue_push, .{ usize, &queue, test_int, &min_push_time, &max_push_time, &total_push_time });
+        consumer_threads[i] = try std.Thread.spawn(.{}, test_func.time_queue_pop, .{ usize, &queue, &min_pop_time, &max_pop_time, &total_pop_time });
+    }
+
+    for (producer_threads ++ consumer_threads) |thread| {
+        thread.join();
+    }
+
+    const min_push = min_push_time.load(.acquire);
+    const min_pop = min_pop_time.load(.acquire);
+    const max_push = max_push_time.load(.acquire);
+    const max_pop = max_pop_time.load(.acquire);
+    const total_push = total_push_time.load(.acquire);
+    const total_pop = total_pop_time.load(.acquire);
+
+    utils.header("Vyukov performance test");
+    std.debug.print("Push Stats:\n", .{});
+    utils.short_line();
+    std.debug.print("Min: {d}\nMax: {d}\nAverage: {d}\n", .{ min_push, max_push, total_push / (8 * 512) });
+    utils.short_line();
+    std.debug.print("Pop Stats:\n", .{});
+    utils.short_line();
+    std.debug.print("Min: {d}\nMax: {d}\nAverage: {d}\n", .{ min_pop, max_pop, total_pop / (8 * 512) });
+    utils.long_line();
+}
+
+test "ChaseLevDeque performance test" {
+    // Test the performance of the ChaseLevDeque in a multithreaded setting
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    const allocator = gpa.allocator();
+
+    const test_int: usize = 1;
+    var min_push_time = std.atomic.Value(usize).init(1_000_000_000_000);
+    var min_pop_time = std.atomic.Value(usize).init(1_000_000_000_000);
+    var min_steal_time = std.atomic.Value(usize).init(1_000_000_000_000);
+    var max_push_time = std.atomic.Value(usize).init(0);
+    var max_pop_time = std.atomic.Value(usize).init(0);
+    var max_steal_time = std.atomic.Value(usize).init(0);
+    var total_push_time = std.atomic.Value(usize).init(0);
+    var total_pop_time = std.atomic.Value(usize).init(0);
+    var total_steal_time = std.atomic.Value(usize).init(0);
+
+    var queue = try ChaseLevDeque(usize).init(allocator, 4096);
+    defer queue.deinit();
+
+    var stealer_threads: [8]std.Thread = undefined;
+
+    for (0..stealer_threads.len) |i| {
+        stealer_threads[i] = try std.Thread.spawn(.{}, test_func.time_deque_steal, .{ usize, &queue, &min_steal_time, &max_steal_time, &total_steal_time });
+    }
+
+    try test_func.time_deque_push(usize, &queue, test_int, &min_push_time, &max_push_time, &total_push_time);
+    try test_func.time_deque_pop(usize, &queue, &min_pop_time, &max_pop_time, &total_pop_time);
+
+    const min_push = min_push_time.load(.acquire);
+    const min_pop = min_pop_time.load(.acquire);
+    const min_steal = min_steal_time.load(.acquire);
+    const max_push = max_push_time.load(.acquire);
+    const max_pop = max_pop_time.load(.acquire);
+    const max_steal = max_steal_time.load(.acquire);
+    const total_push = total_push_time.load(.acquire);
+    const total_pop = total_pop_time.load(.acquire);
+    const total_steal = total_steal_time.load(.acquire);
+
+    utils.header("ChaseLevDeque performance test");
+    std.debug.print("Push Stats:\n", .{});
+    utils.short_line();
+    std.debug.print("Min: {d}\nMax: {d}\nAverage: {d}\n", .{ min_push, max_push, total_push / 4096 });
+    utils.short_line();
+    std.debug.print("Pop Stats:\n", .{});
+    utils.short_line();
+    std.debug.print("Min: {d}\nMax: {d}\nAverage: {d}\n", .{ min_pop, max_pop, total_pop / 4096 });
+    utils.short_line();
+    std.debug.print("Steal Stats:\n", .{});
+    utils.short_line();
+    std.debug.print("Min: {d}\nMax: {d}\nAverage: {d}\n", .{ min_steal, max_steal, total_steal / (8 * 256) });
+    utils.long_line();
 }
