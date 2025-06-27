@@ -172,23 +172,26 @@ pub const Consumer = struct {
 
                 // Now we have a consumer to steal from
                 const other = &self.steal_from[idx];
-                const has_task = other.queue.steal() catch {
-                    // Another Consumer stole first, ignore and try again
-                    std.time.sleep(1);
-                    continue;
-                };
+                while (true) {
+                    const has_task = other.queue.steal() catch {
+                        // Another Consumer stole first, ignore and try again
+                        std.time.sleep(1);
+                        break;
+                    };
 
-                // Deque might be empty
-                if (has_task) |task| {
-                    // Task was successfully stolen, run the task
-                    task.func(task.ctx);
-                    task.deinit(task.ctx, task.allocator);
+                    // Deque might be empty
+                    if (has_task) |task| {
+                        // Task was successfully stolen, run the task
+                        task.func(task.ctx);
+                        task.deinit(task.ctx, task.allocator);
 
-                    // Let the ThreadGroup know that this task is complete
-                    other.group.decrement();
-                } else {
-                    // Give up a cycle before trying again
-                    std.time.sleep(1);
+                        // Let the ThreadGroup know that this task is complete
+                        other.group.decrement();
+                    } else {
+                        // Give up a cycle before trying again
+                        std.time.sleep(1);
+                        break;
+                    }
                 }
             }
         }
@@ -229,33 +232,36 @@ pub const Consumer = struct {
 
                 // Now we have a consumer to steal from
                 const other = &self.steal_from[idx];
-                const has_task = other.queue.steal() catch {
-                    // Another Consumer stole first, ignore and try again
-                    std.time.sleep(1);
-                    _ = self.profile.?.steal_failures.fetchAdd(1, .acq_rel);
-                    const total_end = try std.time.Instant.now();
-                    const idle_time = total_end.since(total_start) - task_time;
-                    _ = self.profile.?.total_idle_time.fetchAdd(idle_time, .acq_rel);
-                    _ = self.profile.?.total_active_time.fetchAdd(task_time, .acq_rel);
-                    continue;
-                };
+                while (true) {
+                    const has_task = other.queue.steal() catch {
+                        // Another Consumer stole first, ignore and try again
+                        std.time.sleep(1);
+                        _ = self.profile.?.steal_failures.fetchAdd(1, .acq_rel);
+                        const total_end = try std.time.Instant.now();
+                        const idle_time = total_end.since(total_start) - task_time;
+                        _ = self.profile.?.total_idle_time.fetchAdd(idle_time, .acq_rel);
+                        _ = self.profile.?.total_active_time.fetchAdd(task_time, .acq_rel);
+                        break;
+                    };
 
-                // Deque might be empty
-                if (has_task) |task| {
-                    // Task was successfully stolen, run the task
-                    _ = self.profile.?.executed_stolen.fetchAdd(1, .acq_rel);
-                    const task_start = try std.time.Instant.now();
-                    task.func(task.ctx);
-                    task.deinit(task.ctx, task.allocator);
-                    const task_end = try std.time.Instant.now();
-                    task_time = task_end.since(task_start);
+                    // Deque might be empty
+                    if (has_task) |task| {
+                        // Task was successfully stolen, run the task
+                        _ = self.profile.?.executed_stolen.fetchAdd(1, .acq_rel);
+                        const task_start = try std.time.Instant.now();
+                        task.func(task.ctx);
+                        task.deinit(task.ctx, task.allocator);
+                        const task_end = try std.time.Instant.now();
+                        task_time = task_end.since(task_start);
 
-                    // Let the ThreadGroup know that this task is complete
-                    other.group.decrement();
-                } else {
-                    // Sleep for a short period before trying again
-                    std.time.sleep(1);
-                    _ = self.profile.?.steal_failures.fetchAdd(1, .acq_rel);
+                        // Let the ThreadGroup know that this task is complete
+                        other.group.decrement();
+                    } else {
+                        // Sleep for a short period before trying again
+                        std.time.sleep(1);
+                        _ = self.profile.?.steal_failures.fetchAdd(1, .acq_rel);
+                        break;
+                    }
                 }
             }
 
