@@ -1,5 +1,5 @@
 const std = @import("std");
-const data = @import("lock-free.zig");
+const data = @import("data-structures.zig");
 const utils = @import("test-utils.zig");
 
 /// Potential ThreadPool Errors
@@ -72,19 +72,19 @@ const ConsumerProfile = struct {
 /// More robust consumer thread implementation.
 pub const Consumer = struct {
     /// id: usize - A unique identifier for a thread.
-    /// queue: *ChaseLevDeque - Work to be completed by the Consumer should be submitted here.
+    /// queue: *SPMCDeque - Work to be completed by the Consumer should be submitted here.
     /// worker: std.Thread - The actual thread doing work for the RobustThread.
     /// group: *ThreadGroup - A ThreadGroup that the Consumer is a part of.
-    /// running: *bool - Whether the Consumer should continue running or not.
+    /// running: bool - Whether the Consumer should continue running or not.
     /// steal_from: []Consumer - Other consumers to steal from.
     /// prng: std.Random.DefaultPrng - A random number generator to pull consumer indexes from.
     /// profile: ?ConsumerProfile - If profiling is active, this will act as a benchmark for the Consumer otherwise it will be null.
     /// allocator: std.mem.Allocator - Used by the Consumer to allocate the work queue.
     id: usize,
-    queue: *data.ChaseLevDeque(Task),
+    queue: *data.SPMCDeque(Task),
     worker: std.Thread,
     group: *ThreadGroup,
-    running: *bool,
+    running: bool,
     pool_size: usize,
     steal_from: []Consumer,
     prng: *std.Random.Xoshiro256,
@@ -103,11 +103,8 @@ pub const Consumer = struct {
     ///     profiling: bool - Whether this Consumer should profile or not.
     pub fn init(allocator: std.mem.Allocator, id: usize, group: *ThreadGroup, pool_size: usize, queue_size: usize, profiling: bool) !Self {
         // Allocate the per-worker queue
-        const queue = try allocator.create(data.ChaseLevDeque(Task));
-        queue.* = try data.ChaseLevDeque(Task).init(allocator, queue_size);
-
-        // Allocate the running boolean sentinel value
-        const running = try allocator.create(bool);
+        const queue = try allocator.create(data.SPMCDeque(Task));
+        queue.* = try data.SPMCDeque(Task).init(allocator, queue_size);
 
         // Allocate the steal_from field (this needs to be initialized in a separate call)
         const steal_from = try allocator.alloc(Consumer, pool_size);
@@ -126,13 +123,12 @@ pub const Consumer = struct {
             profile = .{ .id = id };
         }
 
-        return Self{ .id = id, .queue = queue, .worker = undefined, .group = group, .running = running, .pool_size = pool_size, .steal_from = steal_from, .prng = prng, .profile = profile, .allocator = allocator };
+        return Self{ .id = id, .queue = queue, .worker = undefined, .group = group, .running = true, .pool_size = pool_size, .steal_from = steal_from, .prng = prng, .profile = profile, .allocator = allocator };
     }
 
     /// Destroy a consumer.
     pub fn deinit(self: *Self) void {
         self.allocator.destroy(self.queue);
-        self.allocator.destroy(self.running);
         self.allocator.free(self.steal_from);
         self.allocator.destroy(self.prng);
     }
@@ -152,7 +148,7 @@ pub const Consumer = struct {
     /// queue is empty, steal from other workers.
     fn consume(self: *Self) !void {
         // Check if the Consumer should continue running
-        while (self.running.*) {
+        while (self.running) {
             // See if a task is ready
             const task_ready = self.queue.pop();
 
@@ -178,7 +174,7 @@ pub const Consumer = struct {
                 const other = &self.steal_from[idx];
                 const has_task = other.queue.steal() catch {
                     // Another Consumer stole first, ignore and try again
-                    std.time.sleep(10);
+                    std.time.sleep(1);
                     continue;
                 };
 
@@ -191,8 +187,8 @@ pub const Consumer = struct {
                     // Let the ThreadGroup know that this task is complete
                     other.group.decrement();
                 } else {
-                    // Sleep for a short period before trying again
-                    std.time.sleep(10);
+                    // Give up a cycle before trying again
+                    std.time.sleep(1);
                 }
             }
         }
@@ -201,7 +197,7 @@ pub const Consumer = struct {
     // Consume function with profiling set to on.
     fn consume_with_profile(self: *Self) !void {
         // Check if the Consumer should continue running
-        while (self.running.*) {
+        while (self.running) {
             // See if a task is ready
             const task_ready = self.queue.pop();
 
@@ -235,11 +231,12 @@ pub const Consumer = struct {
                 const other = &self.steal_from[idx];
                 const has_task = other.queue.steal() catch {
                     // Another Consumer stole first, ignore and try again
-                    std.time.sleep(10);
+                    std.time.sleep(1);
                     _ = self.profile.?.steal_failures.fetchAdd(1, .acq_rel);
                     const total_end = try std.time.Instant.now();
                     const idle_time = total_end.since(total_start) - task_time;
                     _ = self.profile.?.total_idle_time.fetchAdd(idle_time, .acq_rel);
+                    _ = self.profile.?.total_active_time.fetchAdd(task_time, .acq_rel);
                     continue;
                 };
 
@@ -257,7 +254,7 @@ pub const Consumer = struct {
                     other.group.decrement();
                 } else {
                     // Sleep for a short period before trying again
-                    std.time.sleep(10);
+                    std.time.sleep(1);
                     _ = self.profile.?.steal_failures.fetchAdd(1, .acq_rel);
                 }
             }
@@ -266,12 +263,13 @@ pub const Consumer = struct {
             const total_end = try std.time.Instant.now();
             const idle_time = total_end.since(total_start) - task_time;
             _ = self.profile.?.total_idle_time.fetchAdd(idle_time, .acq_rel);
+            _ = self.profile.?.total_active_time.fetchAdd(task_time, .acq_rel);
         }
     }
 
     // Start up a Consumer
     pub fn start(self: *Self) !void {
-        self.running.* = true;
+        self.running = true;
         if (self.profile) |_| {
             self.worker = try std.Thread.spawn(.{}, Consumer.consume_with_profile, .{self});
         } else {
@@ -281,7 +279,7 @@ pub const Consumer = struct {
 
     // Stop a Consumer (allows the Consumer to exit gracefully).
     pub fn stop(self: *Self) void {
-        self.running.* = false;
+        self.running = false;
         self.worker.join();
     }
 };
@@ -463,20 +461,14 @@ pub const ThreadPool = struct {
     /// Schedule all the tasks currently in the queue to the worker threads.
     pub fn schedule(self: *Self) !void {
         // For each worker, start adding tasks to the worker's queue
-        // var producer_threads = try self.allocator.alloc(std.Thread, self.n_jobs);
-        // var current_consumer = std.atomic.Value(usize).init(0);
-        // defer self.allocator.free(producer_threads);
-        // for (0..self.n_jobs) |i| {
-        //     producer_threads[i] = try std.Thread.spawn(.{}, ThreadPool.populate_consumer_tasks, .{ self, &current_consumer });
-        // }
-        // for (producer_threads) |thread| {
-        //     thread.join();
-        // }
-        var i: usize = 0;
-        while (self.queue.pop()) |task| {
-            self.group.increment();
-            try self.workers[i % self.n_jobs].queue.push(task);
-            i += 1;
+        var producer_threads = try self.allocator.alloc(std.Thread, self.n_jobs);
+        var current_consumer = std.atomic.Value(usize).init(0);
+        defer self.allocator.free(producer_threads);
+        for (0..self.n_jobs) |i| {
+            producer_threads[i] = try std.Thread.spawn(.{}, ThreadPool.populate_consumer_tasks, .{ self, &current_consumer });
+        }
+        for (producer_threads) |thread| {
+            thread.join();
         }
     }
 
@@ -806,7 +798,7 @@ test "ThreadPool performance test" {
     const seq_end_time = try std.time.Instant.now();
     const seq_elapsed: f64 = @floatFromInt(seq_end_time.since(seq_start_time));
 
-    const n_jobs: usize = 16;
+    const n_jobs: usize = 32;
     var t_pool = try ThreadPool.init(allocator, .{ .n_jobs = n_jobs, .profiling = true });
     for (0..n_jobs) |j| {
         try t_pool.spawn(*const fn (usize, []u64, usize) void, test_func.par_square, .{ j, par_arr, n_jobs });
@@ -859,7 +851,7 @@ test "ThreadPool benchmarks" {
 
     simple_t_pool.deinit();
 
-    const n_jobs: usize = 8;
+    const n_jobs: usize = 16;
     var t_pool = try ThreadPool.init(allocator, .{ .n_jobs = n_jobs, .profiling = true, .queue_size = 16384 });
     defer t_pool.deinit();
 

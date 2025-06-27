@@ -1,7 +1,7 @@
 const std = @import("std");
 const utils = @import("test-utils.zig");
 
-pub const LockFreeError = error{
+pub const DSError = error{
     InvalidCapacity, // A Queues capacity must be a power of 2
     QueueFull, // A thread is trying to push to a full queue
     AlreadyStolen, // A thread has stolen a value concurrently from the queue
@@ -45,7 +45,7 @@ pub fn VyukovQueue(comptime T: type) type {
         ///     An instantiated VyukovQueue or error on allocation fail.
         pub fn init(allocator: std.mem.Allocator, capacity: usize) !Self {
             if (capacity & (capacity - 1) != 0) {
-                return LockFreeError.InvalidCapacity;
+                return DSError.InvalidCapacity;
             }
             const buffer_mask: usize = capacity - 1;
             const buffer = try allocator.alloc(Slot, capacity);
@@ -84,7 +84,7 @@ pub fn VyukovQueue(comptime T: type) type {
                     }
                 } else if (seq < pos) {
                     // The queue is full
-                    return LockFreeError.QueueFull;
+                    return DSError.QueueFull;
                 } else {
                     // The slot has been updated since last checking
                     pos = self.push_pos.load(.acquire);
@@ -135,137 +135,109 @@ pub fn VyukovQueue(comptime T: type) type {
     };
 }
 
-/// A lock-free double ended queue.
-/// This is based on the Chase-Lev deque (https://www.dre.vanderbilt.edu/~schmidt/PDF/work-stealing-dequeue.pdf)
-/// The Chase-Lev deque offers a lock-free work-stealing queue
-/// that overcomes the buffer overflow issue of many current
-/// work stealing deques.
-pub fn ChaseLevDeque(comptime T: type) type {
+/// This queue is a Single Producer/Multiple Consumer deque.
+/// This queue is a ring buffer that requires a mutex for the stealing index.
+pub fn SPMCDeque(comptime T: type) type {
     return struct {
-        /// bottom: std.atomic.Value(usize) - Values are only pushed and popped from bottom in the owner thread.
-        /// top: std.atomic.Value(usize) - Values are only stolen (never pushed) from the top by other threads.
-        /// buffer: []T - The queue is a circular buffer of values.
-        /// buffer_mask: usize - Value used to quickly determine the value associated with an index.
-        /// allocator: std.mem.Allocator - An allocator to allocate the buffer.
-        bottom: std.atomic.Value(usize),
-        top: std.atomic.Value(usize),
+        /// buffer: []T - A Ring buffer that holds the data.
+        /// buffer_mask: usize - A value used to index into the buffer.
+        /// lock: std.Thread.Mutex - Locks the top pointer.
+        /// top: usize - Pointer to steal from.
+        /// bottom: usize - Pointer to push/pop from. Owned by the current thread.
+        /// allocator: std.mem.Allcator - The allocator used to create the buffer.
         buffer: []T,
         buffer_mask: usize,
+        lock: std.Thread.Mutex,
+        top: usize,
+        bottom: usize,
         allocator: std.mem.Allocator,
 
         const Self = @This();
 
-        /// Initialize a ChaseLevDeque
+        /// Initialize a SPMCDeque object.
         /// Arguments:
-        ///     allocator: std.mem.Allocator - An allocator to allocate the buffer.
-        ///     capacity: usize - The initial capacity of the buffer (must be a power of 2).
+        ///     allocator: std.mem.Allocator - An allocator to create the ring buffer.
+        ///     capacity: usize - The initial capacity (must be power of 2).
         /// Returns:
-        ///     An initialized ChaseLevDeque object.
+        ///     Initialized SPMCDeque on success, error on allocation error.
         pub fn init(allocator: std.mem.Allocator, capacity: usize) !Self {
             if (capacity & (capacity - 1) != 0) {
-                return LockFreeError.InvalidCapacity;
+                return DSError.InvalidCapacity;
             }
-            const buffer_mask = capacity - 1;
+
             const buffer = try allocator.alloc(T, capacity);
-            return Self{ .bottom = std.atomic.Value(usize).init(0), .top = std.atomic.Value(usize).init(0), .buffer = buffer, .buffer_mask = buffer_mask, .allocator = allocator };
+            return Self{ .buffer = buffer, .buffer_mask = capacity - 1, .lock = .{}, .top = 0, .bottom = 0, .allocator = allocator };
         }
 
-        /// Destroy a ChaseLevDeque object
+        /// Destroy an instance of the SPMCDeque
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.buffer);
         }
 
-        /// Perform a CAS operation on the top pointer.
+        /// Push a value to the deque.
         /// Arguments:
-        ///     expected_value: usize - Check if the value is equal to this expected value.
-        ///     new_value: usize - If the comparison works, substitute this value.
+        ///     value: T - The value to push.
         /// Returns:
-        ///     true on success, false on failure.
-        pub fn casTop(self: *Self, expected_value: usize, new_value: usize) bool {
-            // @cmpxchgStrong returns null on sucess, so this seems backwards
-            if (self.top.cmpxchgStrong(expected_value, new_value, .acq_rel, .acquire)) |_| {
-                return false;
-            }
-            return true;
-        }
-
-        /// Push a value to the bottom of the deque. This is an easy operation
-        /// since only the owner thread will be pushing to the deque.
-        /// Arguments:
-        ///     value: T - The value to push to the bottom of the queue.
-        /// Returns:
-        ///     void on success, LockFreeError.QueueFull when the queue is full.
+        ///     void on success, error on queue full.
         pub fn push(self: *Self, value: T) !void {
-            const b = self.bottom.load(.acquire);
-            const t = self.top.load(.acquire);
-            if (b - t >= self.buffer_mask) {
-                return LockFreeError.QueueFull;
+            // Must read the top value
+            self.lock.lock();
+
+            if (self.bottom - self.top >= self.buffer.len) {
+                // Deque is full
+                return DSError.QueueFull;
             }
-            self.buffer[b & self.buffer_mask] = value;
-            self.bottom.store(b + 1, .release);
+
+            self.buffer[self.bottom & self.buffer_mask] = value;
+            self.bottom += 1;
+            self.lock.unlock();
         }
 
-        /// Steal a value from the top of the deque. The stealing thread must ensure
-        /// that another thread has not already stole the bottom value.
+        /// Steal a value from the deque.
         /// Returns:
-        ///     A value if one is available, null on empty, LockFreeError.AlreadyStolen
-        ///     if another concurrent thread stole the top before we had a chance.
+        ///     A value on success, null on queue empty, error if another thread is stealing.
         pub fn steal(self: *Self) !?T {
-            const t = self.top.load(.acquire);
-            const b = self.bottom.load(.acquire);
+            if (self.lock.tryLock()) {
+                // No other thread is stealing right now
+                if (self.bottom == self.top) {
+                    // Queue is empty
+                    self.lock.unlock();
+                    return null;
+                }
 
-            // Deque is empty
-            if (b <= t) {
-                return null;
-            }
-
-            // Must grab value before CAS because after CAS, this value
-            // may be written over with another value by push (due to circular buffer)
-            const value = self.buffer[t & self.buffer_mask];
-            if (!self.casTop(t, t + 1)) {
-                return LockFreeError.AlreadyStolen;
-            }
-            return value;
-        }
-
-        /// Pop a value from the bottom of the deque. Pop is a little more complicated
-        /// because a pop/steal race may arise.
-        /// Retunrs:
-        ///     A value if one is available, null on empty.
-        pub fn pop(self: *Self) ?T {
-            // Decrement the bottom pointer to get the next Task
-            var b = self.bottom.load(.acquire);
-            b = b - 1;
-            self.bottom.store(b, .release);
-            const t = self.top.load(.acquire);
-
-            // The deque is empty
-            if (b < t) {
-                // Reset the deque back to a canonical empty state (bottom = top)
-                self.bottom.store(t, .release);
-                return null;
-            }
-
-            // Deque is not empty, but a concurrent steal operation could still
-            // race on this task
-            var value: T = self.buffer[b & self.buffer_mask];
-            if (b > t) {
-                // Race condition not possible (more than one item in deque)
+                // We own the top so grab the top value
+                const value = self.buffer[self.top & self.buffer_mask];
+                self.top += 1;
+                self.lock.unlock();
                 return value;
             }
+            return DSError.AlreadyStolen;
+        }
 
-            // Race condition possible (one item left in deque)
-            // Try to increment top by one to test if top has been accessed
-            if (!self.casTop(t, t + 1)) {
-                // Last element was stolen, reset deque back to canonical empty state (bottom = top)
-                // We can set bottom = t + 1 because top will be t + 1 regardless of the
-                // result of the CAS (either we changed it or a steal operation did)
-                value = null;
+        /// Pop a value from the queue.
+        /// Returns:
+        ///     A value on success, null on queue empty.
+        pub fn pop(self: *Self) ?T {
+            // Must read the current value of top
+            self.lock.lock();
+
+            if (self.bottom == self.top) {
+                self.lock.unlock();
+                return null;
             }
 
-            // No race condition, reset deque back to canonical empty state (bottom = top)
-            self.bottom.store(t + 1, .release);
-            return value;
+            // Decrement bottom to point at the last item in the buffer
+            self.bottom -= 1;
+
+            // Grab the value in the bottom and return it if the top hasn't been stolen
+            const value = self.buffer[self.bottom & self.buffer_mask];
+            if (self.bottom >= self.top) {
+                self.lock.unlock();
+                return value;
+            }
+            self.bottom = self.top;
+            self.lock.unlock();
+            return null;
         }
     };
 }
@@ -286,11 +258,12 @@ const test_func = struct {
     }
 
     /// Test the steal functionality of the deque
-    fn steal_from_deque(comptime T: type, deque: *ChaseLevDeque(T), sum: *std.atomic.Value(T)) void {
+    fn steal_from_deque(comptime T: type, deque: *SPMCDeque(T), sum: *std.atomic.Value(T)) void {
         const has_value = deque.steal() catch {
             return;
         };
         if (has_value) |value| {
+            //std.debug.print("{d}\n", .{value});
             _ = sum.fetchAdd(value, .acq_rel);
         }
     }
@@ -341,8 +314,8 @@ const test_func = struct {
         }
     }
 
-    /// Time the ChaseLevDeque push method
-    fn time_deque_push(comptime T: type, queue: *ChaseLevDeque(T), value: T, min_time: *std.atomic.Value(usize), max_time: *std.atomic.Value(usize), total_time: *std.atomic.Value(usize)) !void {
+    /// Time the SPMCDeque push method
+    fn time_deque_push(comptime T: type, queue: *SPMCDeque(T), value: T, min_time: *std.atomic.Value(usize), max_time: *std.atomic.Value(usize), total_time: *std.atomic.Value(usize)) !void {
         var min: usize = 1_000_000_000_000;
         var max: usize = 0;
         for (0..4096) |_| {
@@ -364,8 +337,8 @@ const test_func = struct {
         }
     }
 
-    /// Time the ChaseLevDeque pop method
-    fn time_deque_pop(comptime T: type, queue: *ChaseLevDeque(T), min_time: *std.atomic.Value(usize), max_time: *std.atomic.Value(usize), total_time: *std.atomic.Value(usize)) !void {
+    /// Time the SPMCDeque pop method
+    fn time_deque_pop(comptime T: type, queue: *SPMCDeque(T), min_time: *std.atomic.Value(usize), max_time: *std.atomic.Value(usize), total_time: *std.atomic.Value(usize)) !void {
         var min: usize = 1_000_000_000_000;
         var max: usize = 0;
         for (0..4096) |_| {
@@ -387,8 +360,8 @@ const test_func = struct {
         }
     }
 
-    /// Time the ChaseLevDeque steal method
-    fn time_deque_steal(comptime T: type, queue: *ChaseLevDeque(T), min_time: *std.atomic.Value(usize), max_time: *std.atomic.Value(usize), total_time: *std.atomic.Value(usize)) !void {
+    /// Time the SPMCDeque steal method
+    fn time_deque_steal(comptime T: type, queue: *SPMCDeque(T), min_time: *std.atomic.Value(usize), max_time: *std.atomic.Value(usize), total_time: *std.atomic.Value(usize)) !void {
         var min: usize = 1_000_000_000_000;
         var max: usize = 0;
         for (0..256) |_| {
@@ -563,8 +536,8 @@ test "VyukovQueue multi threaded push multi threaded pop" {
     try std.testing.expect(sum.load(.acquire) == 10);
 }
 
-test "ChaseLevDeque test" {
-    // Test the ChaseLevTaskQueue
+test "SPMCDeque test" {
+    // Test the SPMCDeque
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     const allocator = gpa.allocator();
 
@@ -572,7 +545,7 @@ test "ChaseLevDeque test" {
 
     var sum = std.atomic.Value(i32).init(0);
 
-    var deque = try ChaseLevDeque(i32).init(allocator, 1024);
+    var deque = try SPMCDeque(i32).init(allocator, 1024);
     defer deque.deinit();
 
     var threads: [32]std.Thread = undefined;
@@ -642,8 +615,8 @@ test "VyukovQueue performance test" {
     utils.long_line();
 }
 
-test "ChaseLevDeque performance test" {
-    // Test the performance of the ChaseLevDeque in a multithreaded setting
+test "SPMCDeque performance test" {
+    // Test the performance of the SPMCDeque in a multithreaded setting
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     const allocator = gpa.allocator();
 
@@ -658,7 +631,7 @@ test "ChaseLevDeque performance test" {
     var total_pop_time = std.atomic.Value(usize).init(0);
     var total_steal_time = std.atomic.Value(usize).init(0);
 
-    var queue = try ChaseLevDeque(usize).init(allocator, 4096);
+    var queue = try SPMCDeque(usize).init(allocator, 4096);
     defer queue.deinit();
 
     var stealer_threads: [8]std.Thread = undefined;
@@ -680,7 +653,7 @@ test "ChaseLevDeque performance test" {
     const total_pop = total_pop_time.load(.acquire);
     const total_steal = total_steal_time.load(.acquire);
 
-    utils.header("ChaseLevDeque performance test");
+    utils.header("SPMCDeque performance test");
     std.debug.print("Push Stats:\n", .{});
     utils.short_line();
     std.debug.print("Min: {d}\nMax: {d}\nAverage: {d}\n", .{ min_push, max_push, total_push / 4096 });
