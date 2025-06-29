@@ -406,7 +406,7 @@ test "VyukovQueue single threaded push/pop" {
         }
     }
 
-    try std.testing.expect(sum == 10);
+    try std.testing.expectEqual(10, sum);
 }
 
 test "VyukovQueue fill/empty/fill" {
@@ -443,7 +443,7 @@ test "VyukovQueue fill/empty/fill" {
         }
     }
 
-    try std.testing.expect(sum == 20);
+    try std.testing.expectEqual(20, sum);
 }
 
 test "VyukovQueue multi threaded push single threaded pop" {
@@ -473,7 +473,7 @@ test "VyukovQueue multi threaded push single threaded pop" {
         }
     }
 
-    try std.testing.expect(sum == 10);
+    try std.testing.expectEqual(10, sum);
 }
 
 test "VyukovQueue single threaded push multi threaded pop" {
@@ -500,7 +500,7 @@ test "VyukovQueue single threaded push multi threaded pop" {
         thread.join();
     }
 
-    try std.testing.expect(sum.load(.acquire) == 10);
+    try std.testing.expectEqual(10, sum.load(.acquire));
 }
 
 test "VyukovQueue multi threaded push multi threaded pop" {
@@ -533,7 +533,7 @@ test "VyukovQueue multi threaded push multi threaded pop" {
         thread.join();
     }
 
-    try std.testing.expect(sum.load(.acquire) == 10);
+    try std.testing.expectEqual(10, sum.load(.acquire));
 }
 
 test "SPMCDeque test" {
@@ -566,7 +566,7 @@ test "SPMCDeque test" {
         thread.join();
     }
 
-    try std.testing.expect(sum.load(.acquire) == 1000);
+    try std.testing.expectEqual(1_000, sum.load(.acquire));
 }
 
 test "VyukovQueue performance test" {

@@ -325,6 +325,7 @@ pub const ThreadPool = struct {
     /// queue: *TaskQueue - The queue that tasks come into the pool through.
     /// group: *ThreadGroup - A ThreadGroup that observes the state of the pool's threads.
     /// profile: ?ThreadPoolProfile - Used for profiling a ThreadPool, null if profiling is false.
+    /// running: bool - If the ThreadPool is running.
     /// allocator: std.mem.Allocator - Allocator shared by TaskQueue (MUST BE THREAD SAFE!!!)
     n_jobs: usize,
     handle_errors: bool,
@@ -332,6 +333,7 @@ pub const ThreadPool = struct {
     group: *ThreadGroup,
     queue: *data.VyukovQueue(Task),
     profile: ?ThreadPoolProfile,
+    running: bool,
     allocator: std.mem.Allocator,
 
     // Might need to add a list of ThreadGroups to allow more fine grain control
@@ -373,15 +375,17 @@ pub const ThreadPool = struct {
             profile = .{ .threads_used = ctx.n_jobs };
         }
 
-        return Self{ .n_jobs = ctx.n_jobs, .handle_errors = ctx.handle_errors, .workers = workers, .group = group, .queue = queue, .profile = profile, .allocator = allocator };
+        return Self{ .n_jobs = ctx.n_jobs, .handle_errors = ctx.handle_errors, .workers = workers, .group = group, .queue = queue, .profile = profile, .running = false, .allocator = allocator };
     }
 
     /// Destroy an instance of a ThreadPool.
     /// Join all threads and clean up memory used.
     pub fn deinit(self: *Self) void {
         // Join all threads.
-        for (0..self.n_jobs) |i| {
-            self.workers[i].stop();
+        if (self.running) {
+            for (0..self.n_jobs) |i| {
+                self.workers[i].stop();
+            }
         }
 
         // Clean up allocated memory
@@ -480,6 +484,7 @@ pub const ThreadPool = struct {
 
     /// Start the thread pool workers.
     pub fn start(self: *Self) !void {
+        self.running = true;
         for (0..self.workers.len) |i| {
             try self.workers[i].start();
         }
@@ -516,14 +521,13 @@ pub const ThreadPool = struct {
                 const total_idle_time = consumer_profile.total_idle_time.load(.acquire);
 
                 // Assign values
-                total_time += total_active_time + total_idle_time;
+                total_time += (total_active_time + total_idle_time);
                 pool_profile.*.local_execution += local_execution;
                 pool_profile.*.stolen_execution += stolen_execution;
                 pool_profile.*.tasks_completed += local_execution + stolen_execution;
                 pool_profile.*.stolen_failures += consumer_profile.steal_failures.load(.acquire);
                 pool_profile.*.total_active_time += total_active_time;
                 pool_profile.*.total_idle_time += total_idle_time;
-                pool_profile.*.total_time += total_time;
                 pool_profile.*.tasks_per_second += total_tasks * 1_000_000_000_000;
             }
 
@@ -662,7 +666,7 @@ test "Basic Task run" {
 
     task.func(task.ctx);
 
-    try std.testing.expect(test_int == 11);
+    try std.testing.expectEqual(11, test_int);
 }
 
 test "Complex Task run" {
@@ -742,7 +746,7 @@ test "ThreadGroup wait test" {
         thread.join();
     }
 
-    try std.testing.expect(arg.load(.acquire) == 10);
+    try std.testing.expectEqual(10, arg.load(.acquire));
 }
 
 test "ThreadPool correctness test" {
@@ -852,7 +856,7 @@ test "ThreadPool benchmarks" {
     var profile = simple_t_pool.profile.?;
     std.debug.print("Simple ThreadPool Benchmark\n", .{});
     utils.short_line();
-    std.debug.print("Threads used: {d}\nTasks scheduled: {d}\nTasks completed: {d}\nLocal Execution: {d}\nStolen tasks: {d}\nSteal failures: {d}\nTotal active time: {d}\nTotal idle time: {d}\nTotal time: {d}\nEstimated tasks/sec: {d}\n", .{ profile.threads_used, profile.tasks_scheduled, profile.tasks_completed, profile.local_execution, profile.stolen_execution, profile.stolen_failures, profile.total_active_time, profile.total_idle_time, profile.total_idle_time, profile.tasks_per_second });
+    std.debug.print("Threads used: {d}\nTasks scheduled: {d}\nTasks completed: {d}\nLocal Execution: {d}\nStolen tasks: {d}\nSteal failures: {d}\nTotal active time: {d}\nTotal idle time: {d}\nTotal time: {d}\nEstimated tasks/sec: {d}\n", .{ profile.threads_used, profile.tasks_scheduled, profile.tasks_completed, profile.local_execution, profile.stolen_execution, profile.stolen_failures, profile.total_active_time, profile.total_idle_time, profile.total_time, profile.tasks_per_second });
     utils.short_line();
 
     simple_t_pool.deinit();
@@ -873,7 +877,7 @@ test "ThreadPool benchmarks" {
     profile = t_pool.profile.?;
     std.debug.print("ThreadPool Spin Benchmark\n", .{});
     utils.short_line();
-    std.debug.print("Threads used: {d}\nTasks scheduled: {d}\nTasks completed: {d}\nLocal Execution: {d}\nStolen tasks: {d}\nSteal failures: {d}\nTotal active time: {d}\nTotal idle time: {d}\nTotal time: {d}\nEstimated tasks/sec: {d}\n", .{ profile.threads_used, profile.tasks_scheduled, profile.tasks_completed, profile.local_execution, profile.stolen_execution, profile.stolen_failures, profile.total_active_time, profile.total_idle_time, profile.total_idle_time, profile.tasks_per_second });
+    std.debug.print("Threads used: {d}\nTasks scheduled: {d}\nTasks completed: {d}\nLocal Execution: {d}\nStolen tasks: {d}\nSteal failures: {d}\nTotal active time: {d}\nTotal idle time: {d}\nTotal time: {d}\nEstimated tasks/sec: {d}\n", .{ profile.threads_used, profile.tasks_scheduled, profile.tasks_completed, profile.local_execution, profile.stolen_execution, profile.stolen_failures, profile.total_active_time, profile.total_idle_time, profile.total_time, profile.tasks_per_second });
     utils.short_line();
 
     for (0..10000) |_| {
@@ -888,7 +892,7 @@ test "ThreadPool benchmarks" {
     profile = t_pool.profile.?;
     std.debug.print("ThreadPool Fib Benchmark\n", .{});
     utils.short_line();
-    std.debug.print("Threads used: {d}\nTasks scheduled: {d}\nTasks completed: {d}\nLocal Execution: {d}\nStolen tasks: {d}\nSteal failures: {d}\nTotal active time: {d}\nTotal idle time: {d}\nTotal time: {d}\nEstimated tasks/sec: {d}\n", .{ profile.threads_used, profile.tasks_scheduled, profile.tasks_completed, profile.local_execution, profile.stolen_execution, profile.stolen_failures, profile.total_active_time, profile.total_idle_time, profile.total_idle_time, profile.tasks_per_second });
+    std.debug.print("Threads used: {d}\nTasks scheduled: {d}\nTasks completed: {d}\nLocal Execution: {d}\nStolen tasks: {d}\nSteal failures: {d}\nTotal active time: {d}\nTotal idle time: {d}\nTotal time: {d}\nEstimated tasks/sec: {d}\n", .{ profile.threads_used, profile.tasks_scheduled, profile.tasks_completed, profile.local_execution, profile.stolen_execution, profile.stolen_failures, profile.total_active_time, profile.total_idle_time, profile.total_time, profile.tasks_per_second });
     utils.short_line();
 
     for (0..10000) |_| {
@@ -903,6 +907,6 @@ test "ThreadPool benchmarks" {
     profile = t_pool.profile.?;
     std.debug.print("ThreadPool Sleep Benchmark\n", .{});
     utils.short_line();
-    std.debug.print("Threads used: {d}\nTasks scheduled: {d}\nTasks completed: {d}\nLocal Execution: {d}\nStolen tasks: {d}\nSteal failures: {d}\nTotal active time: {d}\nTotal idle time: {d}\nTotal time: {d}\nEstimated tasks/sec: {d}\n", .{ profile.threads_used, profile.tasks_scheduled, profile.tasks_completed, profile.local_execution, profile.stolen_execution, profile.stolen_failures, profile.total_active_time, profile.total_idle_time, profile.total_idle_time, profile.tasks_per_second });
+    std.debug.print("Threads used: {d}\nTasks scheduled: {d}\nTasks completed: {d}\nLocal Execution: {d}\nStolen tasks: {d}\nSteal failures: {d}\nTotal active time: {d}\nTotal idle time: {d}\nTotal time: {d}\nEstimated tasks/sec: {d}\n", .{ profile.threads_used, profile.tasks_scheduled, profile.tasks_completed, profile.local_execution, profile.stolen_execution, profile.stolen_failures, profile.total_active_time, profile.total_idle_time, profile.total_time, profile.tasks_per_second });
     utils.short_line();
 }
