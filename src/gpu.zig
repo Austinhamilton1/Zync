@@ -313,7 +313,7 @@ pub const AST = struct {
         ///     nodes: A list of nodes to add togehter.
         /// Returns:
         ///     A binary operation composed of smaller operations (all nodes included).
-        pub fn add(self: *xbSelf, nodes: []*ASTNode) *ASTNode {
+        pub fn add(self: *xbSelf, nodes: []const *ASTNode) *ASTNode {
 
             // Get the number of nodes in the list
             const len = nodes.len;
@@ -351,7 +351,7 @@ pub const AST = struct {
         ///     nodes: A list of nodes to add togehter.
         /// Returns:
         ///     A binary operation composed of smaller operations (all nodes included).
-        pub fn sub(self: *xbSelf, nodes: []*ASTNode) *ASTNode {
+        pub fn sub(self: *xbSelf, nodes: []const *ASTNode) *ASTNode {
             // Get the number of nodes in the list
             const len = nodes.len;
 
@@ -388,7 +388,7 @@ pub const AST = struct {
         ///     nodes: A list of nodes to add togehter.
         /// Returns:
         ///     A binary operation composed of smaller operations (all nodes included).
-        pub fn mul(self: *xbSelf, nodes: []*ASTNode) *ASTNode {
+        pub fn mul(self: *xbSelf, nodes: []const *ASTNode) *ASTNode {
             // Get the number of nodes in the list
             const len = nodes.len;
 
@@ -425,7 +425,7 @@ pub const AST = struct {
         ///     nodes: A list of nodes to add togehter.
         /// Returns:
         ///     A binary operation composed of smaller operations (all nodes included).
-        pub fn div(self: *xbSelf, nodes: []*ASTNode) *ASTNode {
+        pub fn div(self: *xbSelf, nodes: []const *ASTNode) *ASTNode {
             // Get the number of nodes in the list
             const len = nodes.len;
 
@@ -462,7 +462,7 @@ pub const AST = struct {
         ///     nodes: A list of nodes to add togehter.
         /// Returns:
         ///     A binary operation composed of smaller operations (all nodes included).
-        pub fn mod(self: *xbSelf, nodes: []*ASTNode) *ASTNode {
+        pub fn mod(self: *xbSelf, nodes: []const *ASTNode) *ASTNode {
             // Get the number of nodes in the list
             const len = nodes.len;
 
@@ -473,11 +473,11 @@ pub const AST = struct {
 
             // If length equals 2, we need parentheses
             if (len == 2) {
-                result.* = ASTNode.create_binary_op(.{ .lhs = nodes[0], .rhs = nodes[1], .op_type = .mod, .parentheses = true });
+                result.* = ASTNode.create_binary_op(.{ .lhs = nodes[0], .rhs = nodes[1], .op_type = .rem, .parentheses = true });
                 return result;
             }
 
-            result.* = ASTNode.create_binary_op(.{ .lhs = nodes[0], .rhs = nodes[1], .op_type = .mod, .parentheses = false });
+            result.* = ASTNode.create_binary_op(.{ .lhs = nodes[0], .rhs = nodes[1], .op_type = .rem, .parentheses = false });
 
             // Recursively build up the expression
             var i: usize = 2;
@@ -488,7 +488,7 @@ pub const AST = struct {
                     parentheses = false;
                 }
                 result = self.ast.allocator.create(ASTNode) catch unreachable;
-                result.* = ASTNode.create_binary_op(.{ .lhs = temp, .rhs = nodes[i], .op_type = .mod, .parentheses = parentheses });
+                result.* = ASTNode.create_binary_op(.{ .lhs = temp, .rhs = nodes[i], .op_type = .rem, .parentheses = parentheses });
             }
 
             return result;
@@ -602,6 +602,7 @@ pub const AST = struct {
 
     /// Destroy an AST object.
     pub fn deinit(self: *Self) void {
+        self._end_block();
         self.identifiers.deinit();
     }
 
@@ -782,7 +783,73 @@ pub const AST = struct {
         }
     }
 
-    /// End a block (i.e, jump out of the block's body)
+    /// Create and enter an if block.
+    /// Arguments:
+    ///     condition: *ASTNode - The condition to enter the if statement.
+    pub fn _if(self: *AST, condition: *ASTNode) void {
+        if (self.context.first) |head| {
+            // Create a block node for the if body
+            const if_body = self.allocator.create(ASTNode) catch unreachable;
+            if_body.* = ASTNode.create_block(self.allocator);
+
+            // Create a branch node
+            const if_node = self.allocator.create(ASTNode) catch unreachable;
+            if_node.* = ASTNode.create_branch(.{ .condition = condition, .if_body = if_body });
+
+            // Grab the current block that this declaration should go in
+            const node: *CtxNode = @fieldParentPtr("node", head);
+            var current_block = node.data;
+
+            // Add the if statement to the current block
+            current_block.block_add(if_node);
+
+            // The new current block is now the if body
+            const new_context = self.allocator.create(CtxNode) catch unreachable;
+            new_context.* = .{ .data = if_body };
+            self.context.prepend(&new_context.node);
+        }
+    }
+
+    /// Create and enter an else block.
+    pub fn _else(self: *AST) void {
+        // Need to remove the current if statement
+        if (self.context.popFirst()) |head| {
+            // Grab the current block
+            const node: *CtxNode = @fieldParentPtr("node", head);
+
+            // Destroy the current context node
+            self.allocator.destroy(node);
+
+            // Grab the ASTNode associated with the block
+            if (self.context.first) |new_head| {
+                // Grab the new current block
+                const new_node: *CtxNode = @fieldParentPtr("node", new_head);
+                const new_current_block = new_node.data;
+
+                // The branch node we are looking for should be the last node in the new current context
+                const ast_node = new_current_block.block.items[new_current_block.block.items.len - 1];
+
+                switch (ast_node.*) {
+                    .branch => |*branch| {
+                        // Create a block node for the else body
+                        const else_body = self.allocator.create(ASTNode) catch unreachable;
+                        else_body.* = ASTNode.create_block(self.allocator);
+
+                        // Set the branch's else body
+                        branch.else_body = else_body;
+
+                        // The new current block is now the else body
+                        const new_context = self.allocator.create(CtxNode) catch unreachable;
+                        new_context.* = .{ .data = else_body };
+                        self.context.prepend(&new_context.node);
+                    },
+                    else => unreachable,
+                }
+            }
+        }
+    }
+
+    /// End a block (i.e., jump out of the block's body)
     pub fn _end_block(self: *AST) void {
         if (self.context.popFirst()) |head| {
             const node: *CtxNode = @fieldParentPtr("node", head);
@@ -870,12 +937,18 @@ test "AST test" {
 
     var xb = kernel.expression_builder();
 
-    kernel._initialize(usize, "a", xb.constant(usize, 1));
-    kernel._initialize(usize, "i", xb.constant(usize, 0));
+    kernel._initialize(usize, "a", xb.constant(usize, 100));
+    kernel._initialize(usize, "b", xb.constant(usize, 50));
 
-    kernel._while(xb.lt(xb.vars("i"), xb.constant(usize, 10)));
-    kernel._assign(xb.vars("a"), xb.mul(&.{ xb.vars("a"), xb.constant(usize, 2), xb.constant(usize, 6) }));
+    kernel._while(xb.neq(xb.vars("b"), xb.constant(usize, 0)));
+    kernel._if(xb.gt(xb.vars("a"), xb.vars("b")));
+    kernel._assign(xb.vars("a"), xb.sub(&.{ xb.vars("a"), xb.vars("b") }));
+    kernel._else();
+    kernel._assign(xb.vars("b"), xb.sub(&.{ xb.vars("b"), xb.vars("a") }));
     kernel._end_block();
     kernel._end_block();
-    std.debug.print("{s}\n", .{kernel.to_opencl_string()});
+
+    const program = kernel.to_opencl_string();
+    const expected_program = "uint a = 100; uint b = 50; while(b != 0) {if(a > b) {a = (a - b);} else {b = (b - a);}}";
+    try std.testing.expect(std.mem.eql(u8, program, expected_program));
 }
