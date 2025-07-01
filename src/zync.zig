@@ -20,8 +20,8 @@ pub fn Zync(comptime T: type) type {
             /// Arguments:
             ///     data: []T - A slice to initialize the iterator on.
             ///     allocator: std.mem.Allocator - An allocator to manage the internal ThreadPool.
-            pub fn init(data: []T, allocator: std.mem.Allocator) !ParallelIteratorSelf {
-                const core_count = try std.Thread.getCpuCount();
+            pub fn init(data: []T, allocator: std.mem.Allocator) ParallelIteratorSelf {
+                const core_count = std.Thread.getCpuCount() catch unreachable;
                 const default_worker_count = core_count / 2;
 
                 // Calculate ceil(sqrt(data.len))
@@ -36,7 +36,7 @@ pub fn Zync(comptime T: type) type {
                 while (queue_size <= sqrt) : (queue_size <<= 1) {}
 
                 // Create a thread pool to work with
-                const t_pool = try pool.ThreadPool.init(allocator, .{ .n_jobs = default_worker_count, .queue_size = queue_size });
+                const t_pool = pool.ThreadPool.init(allocator, .{ .n_jobs = default_worker_count, .queue_size = queue_size }) catch unreachable;
                 return ParallelIteratorSelf{ .t_pool = t_pool, .tasks = sqrt, .data = data };
             }
 
@@ -61,7 +61,7 @@ pub fn Zync(comptime T: type) type {
             /// Run a function in parallel on the data of the ParallelIterator.
             /// Arguments:
             ///     func: *const fn (T) T - A function to run on each value in the slice (each value will be replaced with the return value of this function).
-            pub fn map(self: *ParallelIteratorSelf, func: *const fn (T) T) !void {
+            pub fn map(self: *ParallelIteratorSelf, func: *const fn (T) T) void {
                 // Generate enough tasks to fill the global work queue
                 const block_size = self.data.len / self.tasks;
                 if (self.data.len % self.tasks > 0) {
@@ -72,12 +72,12 @@ pub fn Zync(comptime T: type) type {
                 for (0..self.tasks) |i| {
                     const task_start = block_size * i;
                     const task_end = @min(task_start + block_size, self.data.len);
-                    try self.t_pool.spawn(*const fn ([]T, *const fn (T) T, usize, usize) void, ParallelIterator.par_map, .{ self.data, func, task_start, task_end });
+                    self.t_pool.spawn(*const fn ([]T, *const fn (T) T, usize, usize) void, ParallelIterator.par_map, .{ self.data, func, task_start, task_end }) catch unreachable;
                 }
 
                 // Run the jobs
-                try self.t_pool.schedule();
-                try self.t_pool.start();
+                self.t_pool.schedule() catch unreachable;
+                self.t_pool.start() catch unreachable;
                 self.t_pool.join();
             }
 
@@ -97,7 +97,7 @@ pub fn Zync(comptime T: type) type {
             /// Run a funciton in parallel on the data of the ParallelIterator.
             /// Arguments:
             ///     func: *const fn (T) void - A function to run on each value in the slice (returns nothing).
-            pub fn do(self: *ParallelIteratorSelf, func: *const fn (T) void) !void {
+            pub fn do(self: *ParallelIteratorSelf, func: *const fn (T) void) void {
                 // Generate enough tasks to fill the global work queue
                 const block_size = self.data.len / self.tasks;
                 if (self.data.len % self.tasks > 0) {
@@ -108,12 +108,12 @@ pub fn Zync(comptime T: type) type {
                 for (0..self.tasks) |i| {
                     const task_start = block_size * i;
                     const task_end = @min(task_start + block_size, self.data.len);
-                    try self.t_pool.spawn(*const fn ([]T, *const fn (T) void, usize, usize) void, ParallelIterator.par_do, .{ self.data, func, task_start, task_end });
+                    self.t_pool.spawn(*const fn ([]T, *const fn (T) void, usize, usize) void, ParallelIterator.par_do, .{ self.data, func, task_start, task_end }) catch unreachable;
                 }
 
                 // Run the jobs
-                try self.t_pool.schedule();
-                try self.t_pool.start();
+                self.t_pool.schedule() catch unreachable;
+                self.t_pool.start() catch unreachable;
                 self.t_pool.join();
             }
         };
@@ -122,8 +122,8 @@ pub fn Zync(comptime T: type) type {
         /// Arguments:
         ///     data: []T - The data to iterate over.
         ///     allocator: std.mem.Allocator - An allocator to manage the internal ThreadPool.
-        pub fn par_iter(data: []T, allocator: std.mem.Allocator) !ParallelIterator {
-            return try ParallelIterator.init(data, allocator);
+        pub fn par_iter(data: []T, allocator: std.mem.Allocator) ParallelIterator {
+            return ParallelIterator.init(data, allocator);
         }
     };
 }
@@ -167,11 +167,11 @@ test "Zync map large memory performance test" {
     const seq_end = try std.time.Instant.now();
     const seq_elapsed: f64 = @floatFromInt(seq_end.since(seq_start));
 
-    var iter = try Zync(usize).par_iter(par_square, allocator);
+    var iter = Zync(usize).par_iter(par_square, allocator);
     defer iter.deinit();
 
     const par_start = try std.time.Instant.now();
-    try iter.map(test_func.square);
+    iter.map(test_func.square);
     const par_end = try std.time.Instant.now();
     const par_elapsed: f64 = @floatFromInt(par_end.since(par_start));
 
@@ -205,11 +205,11 @@ test "Zync map CPU intensive performance test" {
     const seq_end = try std.time.Instant.now();
     const seq_elapsed: f64 = @floatFromInt(seq_end.since(seq_start));
 
-    var iter = try Zync(usize).par_iter(par_fib, allocator);
+    var iter = Zync(usize).par_iter(par_fib, allocator);
     defer iter.deinit();
 
     const par_start = try std.time.Instant.now();
-    try iter.map(test_func.fib);
+    iter.map(test_func.fib);
     const par_end = try std.time.Instant.now();
     const par_elapsed: f64 = @floatFromInt(par_end.since(par_start));
 
@@ -243,11 +243,11 @@ test "Zync do performance test" {
     const seq_end = try std.time.Instant.now();
     const seq_elapsed: f64 = @floatFromInt(seq_end.since(seq_start));
 
-    var iter = try Zync(usize).par_iter(par_io, allocator);
+    var iter = Zync(usize).par_iter(par_io, allocator);
     defer iter.deinit();
 
     const par_start = try std.time.Instant.now();
-    try iter.do(test_func.io_sim);
+    iter.do(test_func.io_sim);
     const par_end = try std.time.Instant.now();
     const par_elapsed: f64 = @floatFromInt(par_end.since(par_start));
 
