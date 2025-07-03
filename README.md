@@ -11,7 +11,7 @@ its types.
 
 ### What Zync is not.
 
-Zync currently has no support for hardware accelerated computing (i.e., it has no OpenCL, Vulkan, CUDA, etc. backend).
+Zync currently has no support for hardware accelerated computing (i.e., it has no OpenCL, Vulkan, CUDA, etc. backend). (This is actually in the works right now). 
 
 Zync is not currently a "plug-and-play" library. A working knowledge of the inner-workings of the library will help with implementations.
 
@@ -85,6 +85,17 @@ Once the tasks have been `schedule`d, the `run` method of the `ThreadPool` is ca
   - [X] Work stealing scheduling
   - [X] Optimize work stealing for faster context switches
 - [ ] Start working on Zync library features
-  - [ ] par_sort
-  - [ ] par_iter for slices and arrays
-  - [ ] par_map for par_iter
+  - [X] par_iter for slices and arrays
+    - [X] map
+    - [X] do
+  - [ ] Different backends for the parallel iterator
+    - [X] CPU
+    - [ ] OpenCL
+      - [X] ASTNode for adding a single element to a kernel
+      - [X] Kernel for building an OpenCL kernel in zig-only code
+      - [X] Convert a Kernel to OpenCL code
+      - [ ] Set up GPU communication
+      - [ ] Transfer data to GPU
+      - [ ] Run kernel
+      - [ ] Transfer data back to CPU
+      - [ ] Compile results       
